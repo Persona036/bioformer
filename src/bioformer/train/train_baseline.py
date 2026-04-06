@@ -87,6 +87,10 @@ def main() -> None:
         test_size=float(data_cfg["test_size"]),
         val_size=float(data_cfg["val_size"]),
         seed=int(config["seed"]),
+        target_col=data_cfg["target_col"],
+        stratify=bool(data_cfg.get("stratify_splits", True)),
+        stratify_bins=int(data_cfg.get("stratify_bins", 10)),
+        stratify_tail_quantile=data_cfg.get("stratify_tail_quantile", 0.98),
     )
     write_split_frames(
         frame,

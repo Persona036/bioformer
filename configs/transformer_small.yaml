@@ -8,8 +8,35 @@ data:
   derived_time_col: elapsed_hours
   rebase_time_by_batch: true
   target_col: cer
-  feature_cols: []
+  # Pin the numeric process inputs explicitly instead of relying on auto-inference.
+  feature_cols:
+    - te
+    - fi
+    - wi
+    - zs
+    - phzx
+    - doz
+    - bl1mt
+    - bl2mt
+    - bl3mt
+    - bl4mt
+    - btmt
+    - bymt
+    - bcmt
+    - phlx
+    - jn
+    - nd
+    - ht
+    - zt
+    - nn
+    - our
+    - rq
+    - kla
+    - hx
   diff_feature_cols: []
+  stratify_splits: true
+  stratify_bins: 10
+  stratify_tail_quantile: 0.98
   horizon_hours: 48
   max_seq_len: 192
   test_size: 0.15
@@ -26,6 +53,17 @@ model:
 training:
   batch_size: 32
   epochs: 60
+  target_transform: log1p
+  loss: huber
+  huber_delta: 1.0
+  tail_aware_training: true
+  tail_mid_quantile: 0.95
+  tail_mid_weight: 2.0
+  tail_high_quantile: 0.98
+  tail_high_weight: 4.0
+  tail_weighted_sampler: false
+  tail_weight_eval_loss: false
+  selection_metric: rmse
   learning_rate: 0.0003
   weight_decay: 0.01
   grad_clip_norm: 1.0

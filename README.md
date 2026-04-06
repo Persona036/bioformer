@@ -35,6 +35,9 @@ data/raw/efp/EFP_long.csv
 ```
 
 4. Adjust the config if the source column names differ from the defaults.
+   The provided configs stratify batch splits by final `cer`, and the transformer
+   trains on `log1p(cer)` with a robust loss plus conservative tail weighting to
+   reduce sensitivity to the rare `300+` CER outliers in the dataset.
 
 5. Run the baselines:
 

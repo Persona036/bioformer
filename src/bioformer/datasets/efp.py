@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
+import warnings
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -35,6 +37,7 @@ class BatchSequence:
     x_mask: np.ndarray
     time_hours: np.ndarray
     y_final: float
+    sample_weight: float = 1.0
 
     @property
     def valid_timesteps(self) -> np.ndarray:
@@ -59,6 +62,7 @@ class EFPSequenceDataset(Dataset):
             "time_hours": torch.tensor(seq.time_hours, dtype=torch.float32),
             "padding_mask": torch.tensor(~valid, dtype=torch.bool),
             "y_final": torch.tensor(seq.y_final, dtype=torch.float32),
+            "sample_weight": torch.tensor(seq.sample_weight, dtype=torch.float32),
         }
 
 
@@ -146,6 +150,44 @@ def add_elapsed_time_column(
     return transformed, active_time_col
 
 
+def _build_stratify_labels(
+    batch_targets: pd.Series,
+    *,
+    num_bins: int,
+    tail_quantile: float | None,
+    max_classes: int,
+) -> np.ndarray | None:
+    if len(batch_targets) < 3:
+        return None
+
+    transformed_targets = np.log1p(batch_targets.to_numpy(dtype=np.float64))
+    max_bins = min(max(int(num_bins), 2), len(batch_targets), max(max_classes, 2))
+    for current_bins in range(max_bins, 1, -1):
+        quantile_labels = pd.qcut(
+            transformed_targets,
+            q=current_bins,
+            labels=False,
+            duplicates="drop",
+        )
+        labels = pd.Series(quantile_labels, index=batch_targets.index, dtype="object")
+
+        if tail_quantile is not None:
+            tail_threshold = float(batch_targets.quantile(float(tail_quantile)))
+            tail_mask = batch_targets >= tail_threshold
+            if int(tail_mask.sum()) >= 2:
+                labels.loc[tail_mask] = f"tail_{float(tail_quantile):.2f}"
+
+        counts = labels.value_counts(dropna=False)
+        if counts.empty or len(counts) > max_classes or int(counts.min()) < 2:
+            continue
+        return labels.astype(str).to_numpy()
+    return None
+
+
+def _resolve_split_size(num_items: int, split_size: float) -> int:
+    return max(int(math.ceil(num_items * split_size)), 1)
+
+
 def split_batch_ids(
     frame: pd.DataFrame,
     *,
@@ -153,24 +195,73 @@ def split_batch_ids(
     test_size: float,
     val_size: float,
     seed: int,
+    target_col: str | None = None,
+    stratify: bool = False,
+    stratify_bins: int = 10,
+    stratify_tail_quantile: float | None = 0.98,
 ) -> dict[str, set[str]]:
     batch_ids = np.array(sorted(frame[batch_id_col].astype(str).unique()))
     if len(batch_ids) < 3:
         raise ValueError("At least 3 unique batches are required to create train/val/test splits.")
 
-    train_val_ids, test_ids = train_test_split(
-        batch_ids,
-        test_size=test_size,
-        random_state=seed,
-        shuffle=True,
-    )
+    stratify_labels: np.ndarray | None = None
+    label_lookup: dict[str, str] | None = None
+    if stratify:
+        if target_col is None:
+            raise ValueError("target_col is required when stratify=True.")
+        test_count = _resolve_split_size(len(batch_ids), test_size)
+        train_val_count = len(batch_ids) - test_count
+        relative_val_size = val_size / (1.0 - test_size)
+        val_count = _resolve_split_size(train_val_count, relative_val_size)
+        batch_targets = frame.groupby(batch_id_col, sort=False)[target_col].last().reindex(batch_ids)
+        stratify_labels = _build_stratify_labels(
+            batch_targets,
+            num_bins=stratify_bins,
+            tail_quantile=stratify_tail_quantile,
+            max_classes=min(test_count, val_count),
+        )
+        if stratify_labels is not None:
+            label_lookup = dict(zip(batch_ids.tolist(), stratify_labels.tolist(), strict=True))
+
     relative_val_size = val_size / (1.0 - test_size)
-    train_ids, val_ids = train_test_split(
-        train_val_ids,
-        test_size=relative_val_size,
-        random_state=seed,
-        shuffle=True,
-    )
+    try:
+        train_val_ids, test_ids = train_test_split(
+            batch_ids,
+            test_size=test_size,
+            random_state=seed,
+            shuffle=True,
+            stratify=stratify_labels,
+        )
+        train_val_labels = None
+        if label_lookup is not None:
+            train_val_labels = np.asarray([label_lookup[batch_id] for batch_id in train_val_ids], dtype=object)
+        train_ids, val_ids = train_test_split(
+            train_val_ids,
+            test_size=relative_val_size,
+            random_state=seed,
+            shuffle=True,
+            stratify=train_val_labels,
+        )
+    except ValueError as exc:
+        if stratify_labels is None:
+            raise
+        warnings.warn(
+            f"Falling back to unstratified batch split because stratification failed: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        train_val_ids, test_ids = train_test_split(
+            batch_ids,
+            test_size=test_size,
+            random_state=seed,
+            shuffle=True,
+        )
+        train_ids, val_ids = train_test_split(
+            train_val_ids,
+            test_size=relative_val_size,
+            random_state=seed,
+            shuffle=True,
+        )
     return {
         "train": set(train_ids.tolist()),
         "val": set(val_ids.tolist()),

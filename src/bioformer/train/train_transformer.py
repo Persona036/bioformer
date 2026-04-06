@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import random
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
 import yaml
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
 from bioformer.datasets.efp import (
@@ -27,6 +29,24 @@ from bioformer.datasets.efp import (
 from bioformer.eval.metrics import compute_regression_metrics, dump_metrics
 from bioformer.eval.plots import save_predicted_vs_true_plot
 from bioformer.models.transformer import TimeSeriesTransformer
+
+
+@dataclass(frozen=True, slots=True)
+class TargetTransform:
+    name: str
+    forward: Callable[[torch.Tensor], torch.Tensor]
+    inverse: Callable[[torch.Tensor], torch.Tensor]
+
+
+@dataclass(frozen=True, slots=True)
+class TailAwareTraining:
+    enabled: bool
+    mid_quantile: float
+    mid_weight: float
+    high_quantile: float
+    high_weight: float
+    use_weighted_sampler: bool
+    weight_eval_loss: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,9 +68,142 @@ def load_config(path: str | Path) -> dict:
         return yaml.safe_load(handle)
 
 
-def build_dataloader(sequences, *, batch_size: int, shuffle: bool) -> DataLoader:
+def build_target_transform(name: str) -> TargetTransform:
+    normalized = name.lower()
+    if normalized in {"identity", "none"}:
+        return TargetTransform(
+            name="identity",
+            forward=lambda values: values,
+            inverse=lambda values: values,
+        )
+    if normalized == "log1p":
+        return TargetTransform(
+            name="log1p",
+            forward=lambda values: torch.log1p(values),
+            inverse=lambda values: torch.expm1(values).clamp_min(0.0),
+        )
+    raise ValueError(f"Unsupported target transform: {name}")
+
+
+def build_regression_loss(name: str, *, huber_delta: float) -> nn.Module:
+    normalized = name.lower()
+    if normalized == "mse":
+        return nn.MSELoss(reduction="none")
+    if normalized == "huber":
+        return nn.HuberLoss(delta=huber_delta, reduction="none")
+    raise ValueError(f"Unsupported regression loss: {name}")
+
+
+def build_tail_aware_training(config: dict) -> TailAwareTraining:
+    return TailAwareTraining(
+        enabled=bool(config.get("tail_aware_training", False)),
+        mid_quantile=float(config.get("tail_mid_quantile", 0.90)),
+        mid_weight=float(config.get("tail_mid_weight", 3.0)),
+        high_quantile=float(config.get("tail_high_quantile", 0.98)),
+        high_weight=float(config.get("tail_high_weight", 10.0)),
+        use_weighted_sampler=bool(config.get("tail_weighted_sampler", True)),
+        weight_eval_loss=bool(config.get("tail_weight_eval_loss", True)),
+    )
+
+
+def assign_sample_weights(sequences, weights: np.ndarray) -> None:
+    for sequence, weight in zip(sequences, weights.tolist(), strict=True):
+        sequence.sample_weight = float(weight)
+
+
+def compute_tail_sample_weights(
+    targets: np.ndarray,
+    *,
+    mid_threshold: float,
+    mid_weight: float,
+    high_threshold: float,
+    high_weight: float,
+) -> np.ndarray:
+    weights = np.ones_like(targets, dtype=np.float32)
+    weights[targets >= mid_threshold] = np.float32(mid_weight)
+    weights[targets >= high_threshold] = np.float32(high_weight)
+    return weights
+
+
+def prepare_tail_sample_weights(
+    sequences,
+    *,
+    tail_aware_training: TailAwareTraining,
+) -> dict[str, float | np.ndarray]:
+    targets = np.asarray([sequence.y_final for sequence in sequences], dtype=np.float32)
+    if not tail_aware_training.enabled:
+        weights = np.ones(len(sequences), dtype=np.float32)
+        assign_sample_weights(sequences, weights)
+        return {"weights": weights, "mid_threshold": 0.0, "high_threshold": 0.0}
+
+    mid_threshold = float(np.quantile(targets, tail_aware_training.mid_quantile))
+    high_threshold = float(np.quantile(targets, tail_aware_training.high_quantile))
+    weights = compute_tail_sample_weights(
+        targets,
+        mid_threshold=mid_threshold,
+        mid_weight=tail_aware_training.mid_weight,
+        high_threshold=high_threshold,
+        high_weight=tail_aware_training.high_weight,
+    )
+    assign_sample_weights(sequences, weights)
+    return {
+        "weights": weights,
+        "mid_threshold": mid_threshold,
+        "high_threshold": high_threshold,
+    }
+
+
+def apply_tail_sample_weights(
+    sequences,
+    *,
+    mid_threshold: float,
+    mid_weight: float,
+    high_threshold: float,
+    high_weight: float,
+) -> np.ndarray:
+    targets = np.asarray([sequence.y_final for sequence in sequences], dtype=np.float32)
+    weights = compute_tail_sample_weights(
+        targets,
+        mid_threshold=mid_threshold,
+        mid_weight=mid_weight,
+        high_threshold=high_threshold,
+        high_weight=high_weight,
+    )
+    assign_sample_weights(sequences, weights)
+    return weights
+
+
+def resolve_selection_metric(config: dict, *, tail_aware_training: TailAwareTraining) -> str:
+    selection_metric = str(config.get("selection_metric", "auto")).lower()
+    if selection_metric == "auto":
+        return "loss" if tail_aware_training.enabled else "mae"
+    if selection_metric not in {"loss", "mae", "rmse"}:
+        raise ValueError(f"Unsupported selection metric: {selection_metric}")
+    return selection_metric
+
+
+def build_dataloader(
+    sequences,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    sample_weights: np.ndarray | None = None,
+) -> DataLoader:
     dataset = EFPSequenceDataset(sequences)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0)
+    sampler = None
+    if sample_weights is not None:
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
+        num_workers=0,
+    )
 
 
 def move_batch(batch: dict, device: torch.device) -> dict:
@@ -69,6 +222,7 @@ def run_epoch(
     *,
     optimizer: torch.optim.Optimizer | None,
     loss_fn: nn.Module,
+    target_transform: TargetTransform,
     device: torch.device,
     grad_clip_norm: float,
     use_amp: bool,
@@ -89,14 +243,16 @@ def run_epoch(
 
         with torch.set_grad_enabled(training):
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
-                pred = model(
+                pred_for_loss = model(
                     batch["x_num"],
                     batch["x_mask"],
                     batch["time_hours"],
                     batch["padding_mask"],
                     batch["dataset_id"],
                 )
-                loss = loss_fn(pred, batch["y_final"])
+                target_for_loss = target_transform.forward(batch["y_final"])
+                sample_loss = loss_fn(pred_for_loss, target_for_loss)
+                loss = (sample_loss * batch["sample_weight"]).mean()
 
             if training:
                 if use_amp:
@@ -111,7 +267,8 @@ def run_epoch(
                     optimizer.step()
 
         total_loss += float(loss.detach().cpu().item()) * batch["y_final"].shape[0]
-        preds.append(pred.detach().cpu().numpy())
+        pred_original = target_transform.inverse(pred_for_loss.detach().to(dtype=torch.float32))
+        preds.append(pred_original.cpu().numpy())
         targets.append(batch["y_final"].detach().cpu().numpy())
 
     dataset_size = len(loader.dataset)
@@ -170,6 +327,10 @@ def main() -> None:
         test_size=float(data_cfg["test_size"]),
         val_size=float(data_cfg["val_size"]),
         seed=int(config["seed"]),
+        target_col=data_cfg["target_col"],
+        stratify=bool(data_cfg.get("stratify_splits", True)),
+        stratify_bins=int(data_cfg.get("stratify_bins", 10)),
+        stratify_tail_quantile=data_cfg.get("stratify_tail_quantile", 0.98),
     )
     write_split_frames(
         frame,
@@ -203,8 +364,38 @@ def main() -> None:
             max_seq_len=int(data_cfg["max_seq_len"]),
         )
 
+    tail_aware_training = build_tail_aware_training(train_cfg)
+    tail_weight_state = prepare_tail_sample_weights(
+        sequences["train"],
+        tail_aware_training=tail_aware_training,
+    )
+    if tail_aware_training.enabled and tail_aware_training.weight_eval_loss:
+        for split_name in ("val", "test"):
+            apply_tail_sample_weights(
+                sequences[split_name],
+                mid_threshold=float(tail_weight_state["mid_threshold"]),
+                mid_weight=tail_aware_training.mid_weight,
+                high_threshold=float(tail_weight_state["high_threshold"]),
+                high_weight=tail_aware_training.high_weight,
+            )
+    else:
+        for split_name in ("val", "test"):
+            assign_sample_weights(
+                sequences[split_name],
+                np.ones(len(sequences[split_name]), dtype=np.float32),
+            )
+
     batch_size = int(train_cfg["batch_size"])
-    train_loader = build_dataloader(sequences["train"], batch_size=batch_size, shuffle=True)
+    train_loader = build_dataloader(
+        sequences["train"],
+        batch_size=batch_size,
+        shuffle=True,
+        sample_weights=(
+            np.asarray(tail_weight_state["weights"], dtype=np.float32)
+            if tail_aware_training.enabled and tail_aware_training.use_weighted_sampler
+            else None
+        ),
+    )
     val_loader = build_dataloader(sequences["val"], batch_size=batch_size, shuffle=False)
     test_loader = build_dataloader(sequences["test"], batch_size=batch_size, shuffle=False)
 
@@ -225,10 +416,18 @@ def main() -> None:
         lr=float(train_cfg["learning_rate"]),
         weight_decay=float(train_cfg["weight_decay"]),
     )
-    loss_fn = nn.MSELoss()
+    target_transform = build_target_transform(train_cfg.get("target_transform", "identity"))
+    loss_fn = build_regression_loss(
+        train_cfg.get("loss", "mse"),
+        huber_delta=float(train_cfg.get("huber_delta", 1.0)),
+    )
+    selection_metric = resolve_selection_metric(
+        train_cfg,
+        tail_aware_training=tail_aware_training,
+    )
 
     best_state = None
-    best_val_mae = float("inf")
+    best_score = float("inf")
     patience = 0
     history: list[dict[str, float]] = []
 
@@ -238,6 +437,7 @@ def main() -> None:
             train_loader,
             optimizer=optimizer,
             loss_fn=loss_fn,
+            target_transform=target_transform,
             device=device,
             grad_clip_norm=float(train_cfg["grad_clip_norm"]),
             use_amp=use_amp,
@@ -247,6 +447,7 @@ def main() -> None:
             val_loader,
             optimizer=None,
             loss_fn=loss_fn,
+            target_transform=target_transform,
             device=device,
             grad_clip_norm=float(train_cfg["grad_clip_norm"]),
             use_amp=use_amp,
@@ -260,12 +461,18 @@ def main() -> None:
             "val_loss": float(val_loss),
             "train_mae": float(train_metrics["mae"]),
             "val_mae": float(val_metrics["mae"]),
+            "val_rmse": float(val_metrics["rmse"]),
         }
         history.append(epoch_record)
         print(json.dumps(epoch_record))
 
-        if val_metrics["mae"] < best_val_mae:
-            best_val_mae = val_metrics["mae"]
+        score = {
+            "loss": float(val_loss),
+            "mae": float(val_metrics["mae"]),
+            "rmse": float(val_metrics["rmse"]),
+        }[selection_metric]
+        if score < best_score:
+            best_score = score
             best_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
             patience = 0
         else:
@@ -282,6 +489,7 @@ def main() -> None:
         test_loader,
         optimizer=None,
         loss_fn=loss_fn,
+        target_transform=target_transform,
         device=device,
         grad_clip_norm=float(train_cfg["grad_clip_norm"]),
         use_amp=use_amp,
@@ -307,6 +515,12 @@ def main() -> None:
         "horizon_hours": float(data_cfg["horizon_hours"]),
         "num_features": len(feature_cols),
         "device": device.type,
+        "target_transform": target_transform.name,
+        "loss": train_cfg.get("loss", "mse"),
+        "selection_metric": selection_metric,
+        "tail_aware_training": tail_aware_training.enabled,
+        "tail_mid_threshold": float(tail_weight_state["mid_threshold"]),
+        "tail_high_threshold": float(tail_weight_state["high_threshold"]),
     }
     print(json.dumps(summary, indent=2))
 
